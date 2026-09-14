@@ -21,6 +21,8 @@ class VolumeListener: NSObject, FlutterStreamHandler {
     private var foregroundObserver: NSObjectProtocol?
     private var activationAttempt = 0
     private var isSessionActivated = false
+    private var emitOnStartPending = false
+    private var didEmitActivationFailure = false
 
     var isListening: Bool {
         return outputVolumeObservation != nil
@@ -34,7 +36,6 @@ class VolumeListener: NSObject, FlutterStreamHandler {
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         let args = arguments as! [String: Any]
         let category = AudioSessionCategory.allCases[args[MethodArg.audioSessionCategory] as! Int]
-        let emitOnStart = args[MethodArg.emitOnStart] as! Bool
 
         do {
             try audioSession.setCategory(category.categoryType)
@@ -46,21 +47,26 @@ class VolumeListener: NSObject, FlutterStreamHandler {
             )
         }
 
+        activationRetryWorkItem?.cancel()
+        activationRetryWorkItem = nil
+        removeForegroundObserver()
+        outputVolumeObservation = nil
+
         outputVolumeObservation = audioSession.observe(\.outputVolume) { session, _ in
             events(String(session.outputVolume))
         }
 
-        if emitOnStart {
-            events(String(audioSession.outputVolume))
-        }
-
+        emitOnStartPending = args[MethodArg.emitOnStart] as! Bool
         activationAttempt = 0
         isSessionActivated = false
+        didEmitActivationFailure = false
         foregroundObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didBecomeActiveNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            // Each foreground gets a fresh backoff round.
+            self?.activationAttempt = 0
             self?.activateSession(events: events)
         }
         activateSession(events: events)
@@ -73,6 +79,8 @@ class VolumeListener: NSObject, FlutterStreamHandler {
         activationRetryWorkItem = nil
         removeForegroundObserver()
         isSessionActivated = false
+        emitOnStartPending = false
+        didEmitActivationFailure = false
         outputVolumeObservation = nil
         try? volumeController.deactivateAudioSession()
         return nil
@@ -88,6 +96,10 @@ class VolumeListener: NSObject, FlutterStreamHandler {
             try audioSession.setActive(true)
             isSessionActivated = true
             removeForegroundObserver()
+            if emitOnStartPending {
+                emitOnStartPending = false
+                events(String(audioSession.outputVolume))
+            }
         } catch {
             scheduleActivationRetry(events: events, lastError: error)
         }
@@ -103,9 +115,9 @@ class VolumeListener: NSObject, FlutterStreamHandler {
             }
             activationRetryWorkItem = workItem
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
-        } else if activationAttempt == Self.retryDelays.count {
-            // Emit the error once; the foreground observer keeps retrying.
-            activationAttempt += 1
+        } else if !didEmitActivationFailure {
+            // Report once per registration; the foreground observer keeps retrying.
+            didEmitActivationFailure = true
             events(FlutterError(
                 code: ErrorCode.registerVolumeListener,
                 message: ErrorMessage.registerVolumeListener,
